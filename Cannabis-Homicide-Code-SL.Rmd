@@ -1,0 +1,1507 @@
+---
+header-includes:
+ \usepackage{float}
+ \usepackage{caption}
+output: 
+   pdf_document:
+     latex_engine: xelatex
+     
+---
+
+\captionsetup[table]{labelformat=empty}
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, cache = TRUE)
+```
+
+```{r}
+library(caret)
+library(tidyverse)
+library(readxl)
+library(dplyr)
+library(pROC)
+library(kableExtra)
+library(gtsummary)
+library(magrittr)
+library(patchwork)
+library(MLeval)
+library(mice)
+library(inspectdf)
+library(haven)
+library(survey)
+library(jtools)
+library(bootImpute)
+library(patchwork)
+library(inspectdf)
+library(foreach)
+library(doParallel)
+library(micemd)
+install.packages("surveybootstrap", repos = NULL, type = "source")
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  cache = TRUE,
+  include = FALSE,
+  fig.height = 6,
+  fig.width = 8
+  )
+
+theme_set(theme_minimal() + theme(
+  legend.position = "bottom",
+  plot.title = element_text(hjust = 0.5)
+))
+
+options(
+  ggplot2.continuous.colour = "viridis",
+  ggplot2.continuous.fill = "viridis",
+  digits = 3)
+
+scale_colour_discrete = scale_colour_viridis_d
+scale_fill_discrete = scale_fill_viridis_d
+```
+
+
+```{r}
+NSDUH <- read_csv("NSDUH.csv")
+NRS <-  read_xlsx("nrs_2013.xlsx")
+NVDRS <- read_sas("nvdrs_2005_2016.sas7bdat")
+```   
+
+
+
+```{r}
+NSDUH <- NSDUH %>% janitor::clean_names()  %>% filter(!(catag7 %in% c("1","2"))) 
+
+NRS <- NRS %>% janitor::clean_names() %>% 
+  mutate(driver_age_years = as.numeric(driver_age_years))
+
+NVDRS <- NVDRS %>% janitor::clean_names() %>%
+  filter(year == 2013) %>% 
+  filter(!(age < 16)) %>% 
+  filter(!(age == 999)) %>%
+  filter(incident_category_c %in% c("2","7","12"))
+```
+
+
+
+```{r}
+clean_NSDUH <- 
+  NSDUH %>% 
+  select(irsex, catag7, catag6, educcat2, newrace2, mrjmon,alcmon) %>% 
+  `rownames<-`( NULL ) %>%
+  mutate(catag7 = case_when(
+                            catag7 == "3" ~ 0,
+                            catag7 == "4" ~ 0,
+                            catag7 == "5" ~ 1,
+                            catag7 == "6" ~ 1,
+                            catag7 == "7" ~ 2)) %>%
+  mutate(catag6 = case_when(catag6 == "1" ~ 0,
+                            catag6 == "2" ~ 0,
+                            catag6 == "3" ~ 0,
+                            catag6 == "4" ~ 2,
+                            catag6 == "5" ~ 3,
+                            catag6 == "6" ~ 4)) %>%
+  mutate(age_5lvl = case_when(catag7 == "0" ~ "0",
+                              catag7 == "1" ~ "1",
+                              catag6 == "2" ~ "2",
+                              catag6 == "3" ~ "3",
+                              catag6 == "4" ~ "4") %>% 
+           fct_relevel("0", "1", "2", "3", "4")) %>%
+  select(-catag7, -catag6) %>%
+  mutate(educcat2 = case_when(educcat2 == "1" ~ "1",
+                              educcat2 == "2" ~ "2",
+                              educcat2 == "3" ~ "3",
+                              educcat2 == "4" ~ "4",
+                              educcat2 == "5" ~ "4"
+                              ) %>% 
+           fct_relevel("1", "2", "3", "4")) %>%
+  rename(education = educcat2,
+         race = newrace2,
+         marijuana_self_report  = mrjmon,
+         alcohol_self_report = alcmon,
+         sex = irsex,
+         age = age_5lvl
+         ) %>%
+  mutate(sex = case_when(sex == "1" ~ "1",
+                         sex == "2" ~ "0") %>% 
+           fct_relevel("0", "1")) %>%
+  mutate(race = case_when(race == "1" ~ "1",
+                          race == "2" ~ "2",
+                          race == "3" ~ "4",
+                          race == "4" ~ "4",
+                          race == "5" ~ "4",
+                          race == "6" ~ "4",
+                          race == "7" ~ "3") %>% 
+           fct_relevel("1", "2", "3", "4")) %>%
+  mutate(across(where(is.numeric),as_factor)) %>%
+  mutate(across(where(is.character),as_factor)) %>%
+  mutate(source = "NSDUH")
+
+clean_NSDUH$weight <- nrow(NSDUH)*NSDUH$analwt_c/sum(NSDUH$analwt_c)
+clean_NSDUH$strata <- NSDUH$vestr
+clean_NSDUH$psu <- NSDUH$verep
+```
+
+
+
+```{r}
+clean_NRS <-
+  NRS %>% 
+  select(driver_age_years,race_group3, gender, education_level_5lvl,
+         marijuana, blood_marijuana_all_13, mg_d_l2, weekly_alcohol, 
+         of_marijuana_all_13, mg_d_l) %>%
+  mutate(sex = ifelse(gender == "Male", "1", "0") %>% 
+           fct_relevel("0", "1")) %>% 
+  mutate(blood_marijuana_all_13 = ifelse(blood_marijuana_all_13 == "THC", "1", "0") %>% 
+           fct_relevel("0", "1")) %>% 
+  mutate(of_marijuana_all_13 = ifelse(of_marijuana_all_13 == "THC", "1", "0") %>% 
+           fct_relevel("0", "1")) %>%
+  mutate(marijuana_self_report = ifelse(str_detect(marijuana, "Past"), "1", "0") %>% 
+           fct_relevel("0", "1")) %>%
+  mutate(mg_d_l2 = as.numeric(mg_d_l2)) %>% 
+  mutate(alcohol_blood = case_when(mg_d_l2 < 10 ~ "0",
+                                   10 <= mg_d_l2 ~ "1") %>%
+           fct_relevel("0", "1")) %>%
+  mutate(mg_d_l = as.numeric(mg_d_l)) %>% 
+  mutate(alcohol_oral = case_when(mg_d_l < 10 ~ "0",
+                                   10 <= mg_d_l ~ "1") %>%
+           fct_relevel("0", "1")) %>%
+  rename(age = driver_age_years) %>%
+  mutate(age = case_when(16 <= age & age < 21 ~ "0",
+                         21 <= age & age <= 34  ~ "1",
+                         35 <= age & age <= 49  ~ "2",
+                         50 <= age & age <= 64  ~ "3",
+                         65 <= age  & age < 100  ~ "4") %>% 
+           fct_relevel("0", "1", "2", "3", "4")) %>%
+  mutate(race_group3 = as.numeric(race_group3)) %>% 
+  mutate(race_group3 = case_when(race_group3 == 0 ~ "2",
+                                 race_group3 == 1 ~ "4",
+                                 race_group3 == 2 ~ "3",
+                                 race_group3 == 3 ~ "1",
+                                 race_group3 == 4 ~ "4",
+                                 ) %>% 
+           fct_relevel("1", "2", "3", "4")) %>%
+  mutate(race_group3 = as.numeric(race_group3)) %>% 
+  mutate(alcohol_self_report = case_when(weekly_alcohol == "0" ~ "0",
+                                         weekly_alcohol == "1-2" ~ "1",
+                                         weekly_alcohol == "3-4" ~ "1",
+                                         weekly_alcohol == "5-7" ~ "1",
+                                         weekly_alcohol == "8-14" ~ "1",
+                                         weekly_alcohol == "More than 14" ~ "1"
+                                         )  %>% 
+           fct_relevel("0", "1")) %>%
+  mutate(education_level_5lvl = as.numeric(education_level_5lvl)) %>%
+  mutate(education_level_5lvl = case_when(education_level_5lvl == 1 ~ "1",
+                                          education_level_5lvl == 2 ~ "2",
+                                          education_level_5lvl == 3 ~ "3",
+                                          education_level_5lvl == 4 ~ "4",
+                                          education_level_5lvl == 5 ~ "4"
+                                          )  %>% 
+           fct_relevel("1", "2", "3", "4")) %>%
+  mutate(education_level_5lvl = as.numeric(education_level_5lvl)) %>% 
+  rename(education = education_level_5lvl, race = race_group3, 
+         marijuana_blood = blood_marijuana_all_13, marijuana_oral = of_marijuana_all_13) %>%
+  select(-mg_d_l2, -weekly_alcohol, -gender, -marijuana, -mg_d_l)  %>%
+  mutate(across(where(is.character),as_factor))  %>%
+  mutate(across(where(is.numeric),as_factor)) %>%
+  mutate(source = "NRS")
+
+clean_NRS$weight <- NRS$new_final_weights
+clean_NRS$strata <- NRS$region 
+clean_NRS$psu <- NRS$psu
+
+clean_NRS <- clean_NRS %>%
+  mutate(strata = case_when(strata == "Northeast" ~ 1,
+                            strata == "South" ~ 2,
+                            strata == "Midwest" ~ 3,
+                            strata == "West" ~ 4,))
+```
+
+
+
+```{r}
+clean_NVDRS <- 
+  NVDRS %>% 
+  select(age, race_ethnicity, education_level, sex, alcohol_level, marijuana_result) %>%
+  mutate(age = case_when(age < 21 ~ "0",
+                         21 <= age & age <= 34  ~ "1",
+                         35 <= age & age <= 49  ~ "2",
+                         50 <= age & age <= 64  ~ "3",
+                         65 <= age & age < 100  ~ "4")%>% 
+           fct_relevel("0","1", "2", "3", "4")) %>%
+   mutate(race_ethnicity = as.factor(race_ethnicity)) %>% 
+   mutate(race = case_when(race_ethnicity == "1" ~ "1",
+                           race_ethnicity == "2" ~ "2",
+                           race_ethnicity == "3" ~ "4",
+                           race_ethnicity == "4" ~ "4",
+                           race_ethnicity == "5" ~ "4",
+                           race_ethnicity == "6" ~ "4",
+                           race_ethnicity == "7" ~ "3",
+                           race_ethnicity == "8" ~ "4")  %>% 
+           fct_relevel("1", "2", "3", "4")) %>%
+  mutate(sex = as.factor(sex)) %>% 
+  mutate(sex = case_when(sex == "1" ~ "1",
+                         sex == "2" ~ "0") %>%
+           fct_relevel("0", "1")) %>%
+  mutate(education_level = as.factor(education_level)) %>%
+  mutate(education = case_when(education_level == 0 ~ "1",
+                               education_level == 1 ~ "1",
+                               education_level == 2 ~ "2",
+                               education_level == 3 ~ "3",
+                               education_level == 4 ~ "4",
+                               education_level == 5 ~ "4",
+                               education_level == 6 ~ "4",
+                               education_level == 7 ~ "4"
+                               )  %>% 
+           fct_relevel("1", "2", "3", "4"))  %>%
+  mutate(marijuana_blood = case_when(marijuana_result == 1 ~ "1",
+                                     marijuana_result == 2 ~ "0"
+                                     ) %>%
+           fct_relevel("0", "1"))   %>% 
+  mutate(alcohol_blood = case_when(alcohol_level < 0.01 ~ "0",
+                                   888 > alcohol_level & alcohol_level >= 0.01 ~ "1") %>%
+           fct_relevel("0", "1")) %>%
+  mutate(across(where(is.character),as.factor))  %>%
+  mutate(across(where(is.numeric),as.factor)) %>%
+  select(-race_ethnicity, -alcohol_level, -marijuana_result, -education_level) %>%
+  mutate(source = "NVDRS")
+  
+clean_NVDRS$weight <- 1
+clean_NVDRS$strata <- 0
+clean_NVDRS$psu <- c(1001:(1000+nrow(clean_NVDRS)))
+```
+  
+  
+  
+
+```{r}
+#Aggregating all three data sets for Table 1
+NRS_NSDUH <-full_join(clean_NRS, clean_NSDUH)
+
+full_data <- full_join(NRS_NSDUH, clean_NVDRS) %>% 
+  relocate(age, sex, race, education, 
+           alcohol_self_report, alcohol_oral,
+           alcohol_blood, marijuana_self_report, 
+           marijuana_oral, marijuana_blood)
+```
+
+
+```{r}
+## Table 1
+result_tbl_df <- 
+  full_data %>% 
+  mutate(sex = case_when(sex == "0" ~ "Female",
+                         sex == "1" ~ "Male") %>% fct_relevel("Male", "Female")) %>%
+  mutate(race = case_when(race == "1" ~ "White",
+                          race == "2" ~ "Black",
+                          race == "3" ~ "Hispanic",
+                          race == "4" ~ "Others") %>% fct_relevel("White", "Black",
+                                                                 "Hispanic", "Others")) %>%
+  mutate(age = case_when(age == "0" ~ "16-20",
+                         age == "1" ~ "21-34",
+                         age == "2" ~ "35-49",
+                         age == "3" ~ "50-64",
+                         age == "4" ~ "$\\geq65$") %>% fct_relevel("16-20", "21-34",
+                                                                     "35-49", "50-64",
+                                                                      "$\\geq65$")) %>%
+  mutate(education = case_when(education == "1" ~ "Less than high school",
+                               education == "2" ~ "High school graduate",
+                               education == "3" ~ "Some college",
+                               education == "4" ~ "College/Some graduate",
+                               )%>% fct_relevel("Less than high school", 
+                                                "High school graduate",
+                                                "Some college", "College/Some graduate")) %>%
+  mutate(marijuana_self_report = case_when(marijuana_self_report == "0" ~ "Negative",
+                                           marijuana_self_report == "1" ~ "Positive") %>% 
+           fct_relevel("Positive", "Negative")) %>%
+  mutate(alcohol_self_report = case_when(alcohol_self_report == "0" ~ "Negative",
+                                         alcohol_self_report == "1" ~ "Positive") %>% 
+           fct_relevel("Positive", "Negative")) %>%
+  mutate(marijuana_oral = case_when(marijuana_oral == "0" ~ "Negative",
+                                    marijuana_oral == "1" ~ "Positive") %>% 
+           fct_relevel("Positive", "Negative")) %>%
+  mutate(alcohol_oral = case_when(alcohol_oral == "0" ~ "Negative",
+                                  alcohol_oral == "1" ~ "Positive")  %>% 
+           fct_relevel("Positive", "Negative")) %>%
+  mutate(marijuana_blood = case_when(marijuana_blood == "0" ~ "Negative",
+                                     marijuana_blood == "1" ~ "Positive") %>% 
+           fct_relevel("Positive", "Negative")) %>%
+  mutate(alcohol_blood = case_when(alcohol_blood == "0" ~ "Negative",
+                                   alcohol_blood == "1" ~ "Positive")  %>% 
+           fct_relevel("Positive", "Negative")) 
+
+result_table <-
+  survey::svydesign(data = result_tbl_df, id = ~psu, weights = ~weight, strata = ~strata, nest = TRUE) %>%
+  tbl_svysummary(by = source,
+                 statistic = list(all_categorical() ~ "{n} ({p})"), missing_text = "Missing",
+                 type = all_dichotomous() ~ "categorical",
+                 digits = list(all_categorical() ~ c(0,1)),
+                 label = list(age ~ "Age (years)", sex ~ "Sex", race ~ "Race", 
+                              education ~ "Education",
+                              alcohol_self_report ~ "Self-reported alcohol use",
+                              alcohol_oral ~ "Oral alcohol test",
+                              alcohol_blood ~ "Blood alcohol test",
+                              marijuana_self_report ~  "Self-reported cannabis use",
+                              marijuana_oral ~ "Oral cannabis test",
+                              marijuana_blood ~ "Blood cannabis test"))
+```
+
+
+
+```{r}
+## Table 1
+result_table[1]$table_body  <- 
+  result_table[1]$table_body   %>%
+      mutate(across(c(stat_1, stat_2, stat_3), ~gsub("NA.*", "-",.))) %>%
+      mutate(across(stat_3, ~gsub(".*20,040*", "-",.))) %>% 
+      mutate(across(stat_2, ~gsub(".*55,160*", "-",.)))
+
+result_table %>%
+  modify_header(all_stat_cols() ~ "**{level}\nN = {n}**") %>% 
+  modify_footnote(c(all_stat_cols()) ~ NA) %>%
+  modify_column_alignment(c(all_stat_cols()), align = "right") %>%
+  bold_labels() %>%
+  as_kable_extra(booktabs = TRUE, caption = "Table 1. Baseline Characteristics (Weighted) of Three U.S. National Data Samples Aged 16 Years and Older: Drivers from the 2013-14 National Roadside Survey of Alcohol and Drug Use (NRS), U.S. population from the 2013-14 National Survey on Drug Use and Health (NSDUH), Homicide Victims from the 2013 National Violent Death Reporting System (NVDRS)", 
+                 col.names = linebreak(c("$\\hspace{3em}$ Characteristics",
+                                         "n = 11,314\nFrequency ($\\%$)",
+                                         "n = 43,465\nFrequency ($\\%$)",
+                                         "n = 4,110\nFrequency ($\\%$)"), align = "c"),
+                 linesep = "", escape = F) %>%
+  add_header_above(c("Data Source" = 1, "NRS" = 1, 
+                     "NSDUH" = 1, "NVDRS"= 1)) %>%
+  kable_styling(full_width = F , html_font = "Cambria", 
+                latex_options = "HOLD_position", font_size = 8.5, position = "center")
+```
+
+
+```{r}
+## Table 2
+table_df1 <- data.frame(Sensitivity = c("66",'63', '62',
+                                       "44",'100', "66", "56", 
+                                       '66',"56",'70',
+                                       '62', "55", '63', '60', "67", "62"),
+                       Specificity = c('88', "91", '98', 
+                                       '98', "99", '94', '94', 
+                                       "94",'94', '96',
+                                       "95",'96','95',"93",'95', "94"),
+                       N1 = c('68', "216", '68', '34', "2",
+                              '254', '134', "162",'167', '27', "32",'29', '123',
+                              "172",'64', "388"),
+                       N2 = c('371', "1,546", '971', '721', "224",
+                              '2,107', '1,726', "2,274",'764', '407', "396",'225', '847', 
+                              "1,428",'1,333', "3,833"),
+                       N = c('439', "1,762", '1,039', '755', "226",
+                             '2,361', '1,860', "2,436",'931', '434', "428",'254', '970',
+                             "1,600",'1,397', "4,221"),
+                       Sensitivity = c('100', "86", '88', '91', "100",
+                                       "90", "83", "95",'71', 
+                                       '90', "100",'100', '82',
+                                       "84",'95', "88"), 
+                       Specificity = c('58', "40", '53', '52', "52",
+                                       '40', '57', "47",'46', 
+                                       '53', "46",'54', '53',
+                                       "46",'45', "47"),
+                       N1 = c('4', "65", '16', '11', "4",
+                              '70', '30', "56",'28', '10',
+                              "6",'3', '34',
+                              "25",'38', "100"),
+                       N2 = c('231', "1,376", '728', '469', "118",
+                              '1,644', '1,278', "1,704",'642', '291',
+                              "285",'142', '612',
+                              "1,150",'1,018', "2,922"),
+                       N = c('235', "1,441", '744', '480', "122",
+                             '1,714', '1,308', "1,760",'670', '301', "291",'145', '646',
+                             "1,175",'1,056', "3,022"))
+
+row.names(table_df1) <- c("16-20", "21-34","35-49", 
+                         "50-64", "$\\geq65$",
+                         "Male", "Female", "White", "Black",
+                         "Hispanic", "Others","Less than high school", 
+                         "High school graduate",
+                         "Some college", "College/Some graduate","All-Inclusive")
+
+table_df <- data.frame(N = c('439', "1,762", '1,039', '755', "226",
+                             '2,361', '1,860', "2,436",'931', '434', "428",'254', '970',
+                             "1,600",'1,397', "4,221"),
+                      Sensitivity = c("66",'63', '62',
+                                       "44",'100', "66", "56", 
+                                       '66',"56",'70',
+                                       '62', "55", '63', '60', "67", "62"),
+                      Specificity = c('88', "91", '98', 
+                                       '98', "99", '94', '94', 
+                                       "94",'94', '96',
+                                       "95",'96','95',"93",'95', "94"),
+                      N = c('235', "1,441", '744', '480', "122",
+                             '1,714', '1,308', "1,760",'670', '301', "291",'145', '646',
+                             "1,175",'1,056', "3,022"),
+                       Sensitivity = c('100', "86", '88', '91', "100",
+                                       "90", "83", "95",'71', 
+                                       '90', "100",'100', '82',
+                                       "84",'95', "88"), 
+                       Specificity = c('58', "40", '53', '52', "52",
+                                       '40', '57', "47",'46', 
+                                       '53', "46",'54', '53',
+                                       "46",'45', "47"))
+
+row.names(table_df) <- c("16-20", "21-34","35-49", 
+                         "50-64", "$\\geq65$",
+                         "Male", "Female", "White", "Black",
+                         "Hispanic", "Others","Less than high school", 
+                         "High school graduate",
+                         "Some college", "College/Some graduate","All-Inclusive")
+
+table_df <- data.frame(N = c("4,221", '439', "1,762", '1,039', '755', "226",
+                             '2,361', '1,860', "2,436",'931', '434', "428",'254', '970',
+                             "1,600",'1,397'),
+                       Sensitivity = c("62", "66",'63', '62',
+                                       "44",'100', "66", "56", 
+                                       '66',"56",'70',
+                                       '62', "55", '63', '60', "67"),
+                       Specificity = c( "94", '88', "91", '98', 
+                                       '98', "99", '94', '94', 
+                                       "94",'94', '96',
+                                       "95",'96','95',"93",'95'),
+                       N = c("3,022", '235', "1,441", '744', '480', "122",
+                             '1,714', '1,308', "1,760",'670', '301', "291",'145', '646',
+                             "1,175",'1,056'),
+                       Sensitivity = c("88", '100', "86", '88', '91', "100",
+                                       "90", "83", "95",'71', 
+                                       '90', "100",'100', '82',
+                                       "84",'95'), 
+                       Specificity = c("47", '58', "40", '53', '52', "52",
+                                       '40', '57', "47",'46', 
+                                       '53', "46",'54', '53',
+                                       "46",'45'))
+
+row.names(table_df) <- c("All-Inclusive", "16-20", "21-34","35-49", 
+                         "50-64", "$\\geq65$",
+                         "Male", "Female", "White", "Black",
+                         "Hispanic", "Others","Less than high school", 
+                         "High school graduate",
+                         "Some college", "College/Some graduate")
+```
+
+
+```{r}
+## Table 2
+kbl(table_df,  align="c", linesep="", booktabs = T, caption = "Table 2. Sensitivity and Specificity of Self-Reported Cannabis and Alcohol Use from the NRS Data Samples with Complete Pairs of Self-Reported Use and Blood Test for Both Cannabis and Alcohol, Stratified by Overall, Age, Sex, Race, Education",
+    col.names = c("n","Sens($\\%$)", "Spec($\\%$)",
+                  "n","Sens($\\%$)", "Spec($\\%$)"), escape = F) %>%
+  group_rows("Overall", 1,1, underline = F) %>% 
+  group_rows("Age (years)", 2,6, underline = F) %>%
+  group_rows("Sex", 7,8) %>% 
+  group_rows("Race", 9,12, underline = F) %>% 
+  group_rows("Education", 13,16, underline = F) %>% 
+  add_header_above(c(" ", "Cannabis Use" = 3,  "Alcohol Use" = 3), bold = T) %>%
+  kable_styling(full_width = F , html_font = "Cambria", 
+                latex_options = "HOLD_position", position = "center")
+```
+
+
+```{r} 
+## For eTable 1
+imp_NRS <- 
+  clean_NRS %>%
+  relocate(source, strata, psu, weight, sex, race, education, age, alcohol_self_report,
+           alcohol_oral, alcohol_blood, marijuana_self_report, marijuana_oral, marijuana_blood)
+imp_NSDUH <-
+  clean_NSDUH  %>% 
+  mutate(alcohol_oral = NA, alcohol_blood = NA, 
+         marijuana_oral = NA, marijuana_blood = NA)  %>% 
+  relocate(source, strata, psu, weight, sex, race, education, age, alcohol_self_report,
+           alcohol_oral, alcohol_blood, marijuana_self_report, marijuana_oral, marijuana_blood)
+
+NRS_NSDUH <- rbind(imp_NRS, imp_NSDUH)
+
+dry_run <- mice(NRS_NSDUH, maxit = 0)
+pred1 <- dry_run$predictorMatrix 
+pred1[,c("source","strata", "psu")] <- 0
+```
+
+
+```{r, include = FALSE} 
+imputed_NRS_NSDUH_df2 <- mice.par(don.na = NRS_NSDUH, m = 20, predictorMatrix = pred1, 
+                                  method = c("logreg", "norm", "norm", "norm",
+                                             "logreg","polyreg","polr", "polr", 
+                                             "lasso.logreg", "lasso.logreg","lasso.logreg",
+                                             "lasso.logreg", "lasso.logreg", "lasso.logreg"), 
+                                  maxit = 10, nnodes = 4, seed = 7)
+
+imputed_NRS_NSDUH_res <- list()
+for (i in 1:20) {
+  imputed_NRS_NSDUH_res[[i]] <- complete(imputed_NRS_NSDUH_df2, i)
+}
+```
+
+
+
+```{r, include = FALSE}
+imp_NVDRS <-
+  clean_NVDRS  %>% 
+  relocate(source, strata,  psu, weight, sex, race, education, age, 
+           alcohol_blood, marijuana_blood)
+
+dry_run <- mice(imp_NVDRS, maxit = 0)
+pred1 <- dry_run$predictorMatrix 
+pred1[,c("source","strata", "psu")] <- 0
+```
+
+
+```{r, include = FALSE}
+imputed_NVDRS_df <- mice.par(don.na = imp_NVDRS, m = 20, predictorMatrix = pred1,
+                             method = c("logreg","norm","norm", "norm", "logreg",
+                                        "polyreg","polr", "polr", 
+                                        "lasso.logreg", "lasso.logreg"), 
+                             maxit = 10, nnodes = 4, seed = 79)
+
+
+imputed_NVDRS_res <- list()
+for (i in 1:20) {
+  imputed_NVDRS_res[[i]] <- complete(imputed_NVDRS_df, i)
+}
+```
+
+
+```{r}
+## Aggregating all three data sets for eTable 1
+imputed_comb <- list()
+for (i in 1:20) {
+  imputed_comb[[i]] <- full_join(imputed_NRS_NSDUH_res[[i]], imputed_NVDRS_res[[i]])
+}
+imputed_comb_res <- do.call(rbind,imputed_comb)
+```
+
+
+
+```{r}
+## eTable 1
+result_tbl_df <- 
+  imputed_comb_res %>% 
+  mutate(sex = case_when(sex == "0" ~ "Female",
+                         sex == "1" ~ "Male") %>% fct_relevel("Male", "Female")) %>%
+  mutate(race = case_when(race == "1" ~ "White",
+                          race == "2" ~ "Black",
+                          race == "3" ~ "Hispanic",
+                          race == "4" ~ "Others") %>% fct_relevel("White", "Black",
+                                                                 "Hispanic", "Others")) %>%
+  mutate(age = case_when(age == "0" ~ "16-20",
+                         age == "1" ~ "21-34",
+                         age == "2" ~ "35-49",
+                         age == "3" ~ "50-64",
+                         age == "4" ~ "$\\geq65$") %>% fct_relevel("16-20", "21-34",
+                                                                     "35-49", "50-64",
+                                                                      "$\\geq65$")) %>%
+  mutate(education = case_when(education == "1" ~ "Less than high school",
+                               education == "2" ~ "High school graduate",
+                               education == "3" ~ "Some college",
+                               education == "4" ~ "College/Some graduate",
+                               )%>% fct_relevel("Less than high school", 
+                                                "High school graduate",
+                                                "Some college", "College/Some graduate")) %>%
+  mutate(marijuana_self_report = case_when(marijuana_self_report == "0" ~ "Negative",
+                                           marijuana_self_report == "1" ~ "Positive") %>% 
+           fct_relevel("Positive", "Negative")) %>%
+  mutate(alcohol_self_report = case_when(alcohol_self_report == "0" ~ "Negative",
+                                         alcohol_self_report == "1" ~ "Positive") %>% 
+           fct_relevel("Positive", "Negative"))  %>%
+  mutate(marijuana_oral = case_when(marijuana_oral == "0" ~ "Negative",
+                                    marijuana_oral == "1" ~ "Positive") %>% 
+           fct_relevel("Positive", "Negative")) %>%
+  mutate(alcohol_oral = case_when(alcohol_oral == "0" ~ "Negative",
+                                  alcohol_oral == "1" ~ "Positive")  %>% 
+           fct_relevel("Positive", "Negative")) %>%
+  mutate(marijuana_blood = case_when(marijuana_blood == "0" ~ "Negative",
+                                     marijuana_blood == "1" ~ "Positive") %>% 
+           fct_relevel("Positive", "Negative")) %>%
+  mutate(alcohol_blood = case_when(alcohol_blood == "0" ~ "Negative",
+                                   alcohol_blood == "1" ~ "Positive")  %>% 
+           fct_relevel("Positive", "Negative")) %>% 
+  relocate(age, sex, race, education, alcohol_self_report, alcohol_oral,
+           alcohol_blood, marijuana_self_report, marijuana_oral, marijuana_blood) 
+  
+result_table <-
+  survey::svydesign(data = result_tbl_df, id = ~psu, weights = ~weight, strata = ~strata, nest = TRUE) %>%
+  tbl_svysummary(by = source,
+                 statistic = list(all_categorical() ~ "{n} ({p})"), missing_text = "Missing",
+                 type = all_dichotomous() ~ "categorical",
+                 digits = list(all_categorical() ~ c(0,1)),
+                 label = list(age ~ "Age (years)", sex ~ "Sex", race ~ "Race", 
+                              education ~ "Education",
+                              alcohol_self_report ~ "Self-reported alcohol use",
+                              alcohol_oral ~ "Oral alcohol test",
+                              alcohol_blood ~ "Blood alcohol test",
+                              marijuana_self_report ~  "Self-reported cannabis use",
+                              marijuana_oral ~ "Oral cannabis test",
+                              marijuana_blood ~ "Blood cannabis test"))
+```
+
+
+```{r}
+## eTable 1 - dividing the aggregated imputed samples by 20
+result_table[1]$table_body <-
+  result_table[1]$table_body %>%
+      mutate(across(c(stat_1), ~gsub("29,735", "1,487",.)),
+             across(c(stat_1), ~gsub("88,786", "4,439",.)),
+             across(c(stat_1), ~gsub("55,412", "2,771",.)),
+             across(c(stat_1), ~gsub("38,522", "1,926",.)),
+             across(c(stat_1), ~gsub("13,828", "691",.)),
+             across(c(stat_1), ~gsub("131,325", "6,566",.)),
+             across(c(stat_1), ~gsub("94,959", "4,748",.)),
+             across(c(stat_1), ~gsub("126,740", "6,337",.)),
+             across(c(stat_1), ~gsub("50,565", "2,528",.)),
+             across(c(stat_1), ~gsub("29,278", "1,464",.)),
+             across(c(stat_1), ~gsub("19,702", "985",.)),
+             across(c(stat_1), ~gsub("20,026", "1,001",.)),
+             across(c(stat_1), ~gsub("54,723", "2,736",.)),
+             across(c(stat_1), ~gsub("75,694", "3,785",.)),
+             across(c(stat_1), ~gsub("75,841", "3,792",.)),
+             across(c(stat_1), ~gsub("125,954", "6,298",.)),
+             across(c(stat_1), ~gsub("100,330", "5,016",.)),
+             across(c(stat_1), ~gsub("6,161", "308",.)),
+             across(c(stat_1), ~gsub("220,123", "11,006",.)),
+             across(c(stat_1), ~gsub("6,895", "345",.)),
+             across(c(stat_1), ~gsub("219,389", "10,969",.)),
+             across(c(stat_1), ~gsub("26,065", "1,303",.)),
+             across(c(stat_1), ~gsub("200,218", "10,011",.)),
+             across(c(stat_1), ~gsub("22,232", "1,112",.)),
+             across(c(stat_1), ~gsub("204,052", "10,203",.)),
+             across(c(stat_1), ~gsub("22,509", "1,125",.)),
+             across(c(stat_1), ~gsub("203,774", "10,189",.)))
+```
+
+
+```{r}
+## eTable 1 - dividing the aggregated imputed samples by 20
+result_table[1]$table_body <- 
+  result_table[1]$table_body %>% 
+      mutate(across(c(stat_2), ~gsub("76,344", "3,817",.)),
+             across(c(stat_2), ~gsub("208,280", "10,414",.)),
+             across(c(stat_2), ~gsub("215,015", "10,751",.)),
+             across(c(stat_2), ~gsub("215,096", "10,755",.)),
+             across(c(stat_2), ~gsub("154,565", "7,728",.)),
+             across(c(stat_2), ~gsub("419,402", "20,970",.)),
+             across(c(stat_2), ~gsub("449,898", "22,495",.)),
+             across(c(stat_2), ~gsub("569,161", "28,458",.)),
+             across(c(stat_2), ~gsub("102,619", "5,131",.)),
+             across(c(stat_2), ~gsub("132,442", "6,622",.)),
+             across(c(stat_2), ~gsub("65,078", "3,254",.)),
+             across(c(stat_2), ~gsub("112,329", "5,616",.)),
+             across(c(stat_2), ~gsub("248,812", "12,441",.)),
+             across(c(stat_2), ~gsub("227,296", "11,365",.)),
+             across(c(stat_2), ~gsub("280,863", "14,043",.)),
+             across(c(stat_2), ~gsub("478,071", "23,904",.)),
+             across(c(stat_2), ~gsub("391,229", "19,561",.)),
+             across(c(stat_2), ~gsub("18,441", "922",.)),
+             across(c(stat_2), ~gsub("850,859", "42,543",.)),
+             across(c(stat_2), ~gsub("22,987", "1,149",.)),
+             across(c(stat_2), ~gsub("846,313", "42,316",.)),
+             across(c(stat_2), ~gsub("68,332", "3,417",.)),
+             across(c(stat_2), ~gsub("800,968", "40,048",.)),
+             across(c(stat_2), ~gsub("59,762", "2,988",.)),
+             across(c(stat_2), ~gsub("809,538", "40,477",.)),
+             across(c(stat_2), ~gsub("63,948", "3,197",.)),
+             across(c(stat_2), ~gsub("805,352", "40,268",.)))
+```
+
+
+```{r}
+## eTable 1 - dividing the aggregated imputed samples by 20
+result_table[1]$table_body <-
+  result_table[1]$table_body %>%
+      mutate(across(c(stat_3), ~gsub("9,780", "489",.)),
+             across(c(stat_3), ~gsub("36,260", "1,813",.)),
+             across(c(stat_3), ~gsub("19,940", "997",.)),
+             across(c(stat_3), ~gsub("11,620", "581",.)),
+             across(c(stat_3), ~gsub("4,600", "230",.)),
+             across(c(stat_3), ~gsub("66,800", "3,340",.)),
+             across(c(stat_3), ~gsub("15,400", "770",.)),
+             across(c(stat_3), ~gsub("24,580", "1,229",.)),
+             across(c(stat_3), ~gsub("46,120", "2,306",.)),
+             across(c(stat_3), ~gsub("7,520", "376",.)),
+             across(c(stat_3), ~gsub("3,980", "199",.)),
+             across(c(stat_3), ~gsub("31,080", "1,554",.)),
+             across(c(stat_3), ~gsub("36,785", "1,839",.)),
+             across(c(stat_3), ~gsub("8,970", "448",.)),
+             across(c(stat_3), ~gsub("5,365", "268",.)),
+             across(c(stat_3), ~gsub("36,495", "1,825",.)),
+             across(c(stat_3), ~gsub("45,705", "2,285",.)),
+             across(c(stat_3), ~gsub("37,455", "1,873",.)),
+             across(c(stat_3), ~gsub("44,745", "2,237",.)))
+```
+
+
+```{r}
+## eTable 1
+result_table[1]$table_body  <- 
+  result_table[1]$table_body  %>%
+      mutate(across(c(stat_1, stat_2, stat_3), ~gsub("NA.*", "-",.))) %>% 
+      mutate(across(stat_3, ~gsub(".*20,040*", "-",.)))
+result_table[1]$table_body <- 
+  result_table[1]$table_body[!result_table[1]$table_body$row_type == "missing",]
+
+result_table %>%
+  modify_header(all_stat_cols() ~ "**{level}\nN = {n}**") %>% 
+  modify_footnote(c(all_stat_cols()) ~ NA) %>%
+  modify_column_alignment(c(all_stat_cols()), align = "right") %>%
+  bold_labels() %>%
+  as_kable_extra(booktabs = TRUE, caption = "Table 3. Baseline Characteristics (Weighted) of Three U.S. National Data Samples Aged 16 Years and Older: Drivers from the 2013-14 NRS, U.S. population from the 2013-14 NSDUH, Homicide Victims from the 2013 NVDRS after Pooling 20 Imputed Samples",
+                 col.names = linebreak(c("$\\hspace{3em}$ Characteristics",
+                                         "N = 11,314\nFrequency ($\\%$)",
+                                         "N = 43,465\nFrequency ($\\%$)",
+                                         "N = 4,110\nFrequency ($\\%$)"), align = "c"),
+                 linesep = "", escape = F) %>%
+  add_header_above(c("Data Source" = 1, "NRS" = 1, 
+                     "NSDUH" = 1, "NVDRS"= 1)) %>%
+  kable_styling(full_width = F , html_font = "Cambria", 
+                latex_options = "HOLD_position", font_size = 9,
+                position = "center")
+```
+
+
+
+```{r}
+## For survey regression modeling and Rubin's rule after multiple imputation
+glm_svy_mi <- function(formula, imputations, m) {
+  
+  #setting up null objects allows us to easily add results
+  b <- se <- NULL
+  
+  #now loop through our imputations and run the model
+  for(i in 1:m) {
+    #grab the complete dataset
+    imputation <- imputations[[i]]
+    #create the design effect object
+    imputation.svy <- svydesign(id=~psu, weight=~weight,strata=~strata, 
+                                data=imputation, nest=TRUE) 
+    #run the model
+    model <- svyglm(formula, design=imputation.svy,family=quasibinomial)
+    #collect the results
+    df <- model$df.residual
+    b <- cbind(b, coef(model))
+    se <- cbind(se, summary(model)$coef[,2])
+  }
+  
+  #now pool the results
+  b.pool <- apply(b, 1, mean)
+  between.var <- apply(b, 1, var)
+  within.var <- apply(se^2, 1, mean)
+  total.var <- within.var+between.var+(between.var/m)
+  se.pool <- sqrt(total.var)
+  lambda <- (between.var+between.var/m)/total.var
+  df.old <- (m-1)/(lambda)^2
+  df.obs <- ((df + 1) / (df + 3)) * df * (1 - lambda)
+  df.adj <- (df.old*df.obs)/(df.old+df.obs)
+  t.val <- qt(0.975, df.adj)
+  coefficients <- data.frame(b.pool, se.pool, t.val)
+  
+  return(coef=coefficients)
+}
+```
+
+
+
+```{r}
+## Bootstrapping for Model 1 (NVDRS)
+list_clean_NVDRS <- list()
+
+set.seed(79)
+
+for (i in 1:200) {
+  list_clean_NVDRS[[i]] <- sample_n(clean_NVDRS, size = nrow(clean_NVDRS),replace = T) %>% 
+  relocate(source, strata,  psu, weight, sex, race, education, 
+           age, alcohol_blood, marijuana_blood)
+}
+
+dry_run <- mice(list_clean_NVDRS[[1]], maxit = 0)
+pred1 <- dry_run$predictorMatrix 
+pred1[,c("source","strata", "psu")] <- 0
+```
+
+
+
+```{r, include=FALSE}
+#Multiple Imputation for bootstrap samples (NVDRS)
+imputed_res <- list()
+imputed_NVDRS_res <- list()
+
+boot_imputed_NVDRS <- function(B){
+  registerDoParallel(2)
+  system.time({
+    imputed_NVDRS_res <- foreach(i = 1:B) %dopar% {
+    
+    df <- list_clean_NVDRS[[i]]
+    NVDRS_df <- mice(data = df, m = 2, predictorMatrix = pred1,
+                     method = c("logreg","norm","norm", "norm", "logreg","polyreg","polr", "polr", 
+                                "lasso.logreg", "lasso.logreg"), 
+                     maxit = 5, seed = 79)
+    for (j in 1:2) {
+      imputed_res[[j]] <- complete(NVDRS_df, j)
+    }
+      
+    imputed_NVDRS_res[[i]] <- imputed_res
+  }
+  })
+  return(imputed_NVDRS_res)
+}
+
+res1_boot <- boot_imputed_NVDRS(200)
+```
+
+
+
+```{r}
+# Bootstrapping for Model 1 (NRS & NSDUH)
+list_clean_NRS <- list()
+list_clean_NSDUH <- list()
+
+set.seed(7)
+
+for (i in 1:200) {
+  list_clean_NRS[[i]] <- clean_NRS %>% group_by(strata) %>% sample_n(size = 2830, replace = T) %>% ungroup()
+  list_clean_NSDUH[[i]] <- clean_NSDUH %>% group_by(strata) %>% sample_n(size = 724, replace = T) %>% ungroup()
+}
+
+
+list_NRS_NSDUH <- list()
+for (i in 1:length(list_clean_NRS)) {
+  list_NRS_NSDUH[[i]] <- full_join(list_clean_NRS[[i]], list_clean_NSDUH[[i]]) %>%
+  relocate(source, strata, psu, weight, sex, race, education, age, alcohol_self_report, alcohol_oral,
+           alcohol_blood, marijuana_self_report, marijuana_oral, marijuana_blood)
+}
+
+dry_run <- mice(list_NRS_NSDUH[[1]], maxit = 0)
+pred1 <- dry_run$predictorMatrix 
+pred1[,c("source","strata", "psu")] <- 0
+```
+
+
+```{r, include=FALSE}
+#Multiple Imputation for bootstrap samples (NRS & NSDUH)
+imputed_res <- list()
+imputed_NRS_NSDUH_res <- list()
+
+boot_imputed_NRS_NSDUH <- function(B){
+  registerDoParallel(2)
+  system.time({
+    imputed_NRS_NSDUH_res <- foreach(i = 1:B) %dopar% {
+    
+    df <- list_NRS_NSDUH[[i]]
+    NRS_NSDUH_df <- mice(data = df, m = 2, predictorMatrix = pred1, 
+                         method = c("logreg", "norm", "norm", "norm", "logreg","polyreg","polr", "polr", 
+                                    "lasso.logreg", "lasso.logreg","lasso.logreg",
+                                    "lasso.logreg", "lasso.logreg", "lasso.logreg"), 
+                         maxit = 5, seed = 7)
+      
+    for (j in 1:2) {
+      imputed_res[[j]] <- complete(NRS_NSDUH_df, j)
+    }
+      
+    imputed_NRS_NSDUH_res[[i]] <- imputed_res
+  }
+  })
+  return(imputed_NRS_NSDUH_res)
+}
+
+res2_boot <- boot_imputed_NRS_NSDUH(200)
+```
+
+
+
+```{r}
+#assemble lists into simpler structures (vectors)
+res1_boot <- do.call(c, res1_boot)
+res2_boot <- do.call(c, res2_boot)
+```
+
+
+```{r}
+##Assigning the outcome variable to imputed bootstrap samples and relevel the categorical variables
+imputed_NVDRS <- list()
+imputed_NRS_NSDUH <- list()
+full_imps <- list()
+
+for (i in 1:length(res1_boot)) {
+  imputed_NVDRS[[i]] <- res1_boot[[i]] %>% mutate(homicide = 1)
+}
+
+for (i in 1:length(res2_boot)) {
+  imputed_NRS_NSDUH[[i]] <- res2_boot[[i]] %>% 
+  select(-marijuana_self_report, -marijuana_oral, -alcohol_self_report, -alcohol_oral)  %>%
+  mutate(homicide = 0)
+}
+
+full_imps <- list()
+for (i in 1:length(res2_boot)) {
+  full_imps[[i]] <- rbind(imputed_NRS_NSDUH[[i]], imputed_NVDRS[[i]]) %>% filter(!(source == "NRS")) %>% 
+  mutate(age = fct_relevel(age, c("3","0","1","2","4")))  %>% 
+  mutate(education = fct_relevel(education, c("2","1","3","4")))
+}
+```
+
+
+```{r}
+## Function for survey regression modeling for each imputed bootstrap sample
+analyseImp <- function(inputData) {
+      svy_mod <- svydesign(strata=~strata, id=~psu, weights=~weight, data=inputData, nest=T) 
+      mod<- svyglm(homicide ~ age + race + education + sex + alcohol_blood + marijuana_blood,
+                   family=quasibinomial, design=svy_mod)
+      res <- summ(mod, exp = TRUE, confint = TRUE)
+      res$coeftable[,1]
+    }
+
+boot_res4 <- list()
+for (i in 1:length(full_imps)) {
+  boot_res4[[i]] <- analyseImp(full_imps[[i]]) %>% t() %>% data.frame() %>% janitor::clean_names()
+}
+
+boot1_res <- do.call(rbind, boot_res4)
+```
+
+
+```{r}
+## Pooling the results of all imputed bootstrap samples
+boot_comb_coef1 <- boot1_res
+boot_comb_coef2 <- boot1_res
+
+for (i in 1:ncol(boot_comb_coef1)) {
+  coef_res <- colMeans(matrix(boot_comb_coef1[,i],2))
+  boot_comb_coef1[,i] <- coef_res
+}
+
+boot_comb_coef_group_mean <- boot_comb_coef1[1:(nrow(boot_comb_coef1)/2),]
+boot_comb_coef_total_mean <- colMeans(boot_comb_coef2)
+```
+
+
+
+```{r}
+## Model 1 result using BMI inference
+nBoot <- 200
+nImp <- 2
+est <- vector()
+var <- vector()
+df <- vector()
+CI <- vector()
+
+for (i in 1:ncol(boot_comb_coef2)) {
+  SSW <- sum((boot_comb_coef2[,i] - rep(boot_comb_coef_group_mean[,i], each = 2))^2)
+  SSB <- nImp*sum((boot_comb_coef_group_mean[,i] - boot_comb_coef_total_mean[i])^2)
+  MSW <- SSW/(nBoot*(nImp-1))
+  MSB <- SSB/(nBoot-1)
+  resVar <- MSW
+  randIntVar <- (MSB-MSW)/nImp
+  est[i] <- boot_comb_coef_total_mean[i]
+  var[i] <- (1+1/nBoot)*randIntVar + resVar/(nBoot*nImp)
+  df[i] <- (var[i]^2)/((((nBoot+1)/(nBoot*nImp))^2*MSB^2 / (nBoot-1)) + MSW^2/(nBoot*nImp^2*(nImp-1)))
+  CI[i] = paste0(est[i] %>% round(digits = 2)," ","(",
+                 (est[i]-stats::qt(0.975,df[i])*var[i]^0.5) %>% round(digits = 2),
+                 ", ",(est[i]+stats::qt(0.975,df[i])*var[i]^0.5) %>% round(digits = 2),")")
+}
+```
+
+
+
+```{r}
+## Model 2
+for (i in 1:20) {
+  imputed_comb[[i]] <- 
+    imputed_comb[[i]] %>%
+    filter(!(source == "NRS")) %>% 
+    mutate(age = fct_relevel(age, c("3","0","1","2","4")))  %>% 
+    mutate(education = fct_relevel(education, c("2","1","3","4"))) %>%
+    mutate(homicide = case_when(source == "NSDUH" ~ "0",
+                                source == "NVDRS" ~ "1")) %>%
+    mutate(homicide = as.numeric(homicide))
+}
+
+mod2_res <- 
+  glm_svy_mi(homicide ~ age + race + education + sex + alcohol_blood + marijuana_blood,imputed_comb, 20)
+
+## Model 2 result
+res2_df <-
+  mod2_res %>% 
+  mutate(OR = exp(b.pool), x2_5 = exp(b.pool - t.val*se.pool), x97_5 = exp(b.pool + t.val*se.pool)) %>%
+  rename(boxOdds = OR,
+         boxCILow = x2_5,
+         boxCIHigh = x97_5) %>% select(boxOdds, boxCILow, boxCIHigh)
+```
+
+
+
+
+```{r}
+## Model 3
+NRS_mod3 <- 
+  clean_NRS %>% 
+  select(-marijuana_self_report, -marijuana_oral, -alcohol_self_report, -alcohol_oral) %>% 
+  mutate(homicide = 0) %>%
+  na.omit()
+
+NVDRS_mod3 <- 
+  clean_NVDRS %>% 
+  mutate(homicide = 1) %>% 
+  na.omit()
+
+mod3_df <- rbind(NRS_mod3, NVDRS_mod3) %>% 
+  mutate(age = fct_relevel(age, c("3","0","1","2","4")))  %>% 
+  mutate(education = fct_relevel(education, c("2","1","3","4")))
+
+svy_mod1 <- svydesign(strata=~strata, id=~psu, weights=~weight, data=mod3_df, nest=T) 
+
+mod3 <- svyglm(homicide ~ age + race + education + sex + alcohol_blood + marijuana_blood,
+               family=quasibinomial, design=svy_mod1)
+
+## Model 3 Result
+res3 <- summ(mod3, exp = TRUE, confint = TRUE)
+```
+
+
+
+```{r, include = FALSE}
+## Model 4
+imp_NRS <- 
+  clean_NRS %>%
+  relocate(source, strata, psu, weight, sex, race, education, age, alcohol_self_report,
+           alcohol_oral, alcohol_blood, marijuana_self_report, marijuana_oral, marijuana_blood)
+
+dry_run <- mice(imp_NRS, maxit = 0)
+pred1 <- dry_run$predictorMatrix 
+pred1[,c("source","strata", "psu")] <- 0
+
+imputed_NRS_df <- mice.par(don.na = imp_NRS, m = 20, predictorMatrix = pred1, 
+                           method = c("logreg", "norm", "norm", "norm", 
+                                      "logreg","polyreg","polr", "polr", 
+                                      "lasso.logreg", "lasso.logreg","lasso.logreg",
+                                      "lasso.logreg", "lasso.logreg", "lasso.logreg"), 
+                           maxit = 10, nnodes = 4, seed = 7)
+```
+
+
+```{r}
+imputed_NRS_res <- list()
+for (i in 1:20) {
+  imputed_NRS_res[[i]] <- complete(imputed_NRS_df, i)  %>% 
+  select(-marijuana_self_report, -marijuana_oral, -alcohol_self_report, -alcohol_oral) %>% 
+  mutate(homicide = 0) 
+}
+
+imputed_NVDRS_res <- list()
+for (i in 1:20) {
+  imputed_NVDRS_res[[i]] <- complete(imputed_NVDRS_df, i) %>% mutate(homicide = 1)
+}
+
+imputed_comb_res2 <- list()
+for (i in 1:20) {
+  imputed_comb_res2[[i]] <- full_join(imputed_NRS_res[[i]], imputed_NVDRS_res[[i]]) %>% 
+  mutate(age = fct_relevel(age, c("3","0","1","2","4")))  %>% 
+  mutate(education = fct_relevel(education, c("2","1","3","4")))
+}
+
+mod4_res <- 
+  glm_svy_mi(homicide ~ age + race + education + sex + alcohol_blood + marijuana_blood, imputed_comb_res2, 20)
+
+## Model 4 result
+res4_df <-
+  mod4_res %>% 
+  mutate(OR = exp(b.pool), x2_5 = exp(b.pool - t.val*se.pool), 
+         x97_5 = exp(b.pool + t.val*se.pool)) %>% 
+  rename(boxOdds = OR,
+         boxCILow = x2_5,
+         boxCIHigh = x97_5) %>% select(boxOdds, boxCILow, boxCIHigh)
+```
+
+
+
+
+```{r}
+## Cleaning the results of all 4 models for Table 3
+res1_tab <- data.frame(CI = CI)
+
+res2_tab <- 
+  res2_df %>%
+  mutate(estimate = boxOdds %>% round(digits = 2) %>% format(nsmall = 2)) %>%
+  mutate(CI = paste0(estimate," (",gsub(" ", "", boxCILow %>% round(digits = 2) %>% format(nsmall = 2)),", ",boxCIHigh %>% round(digits = 2) %>% format(nsmall = 2),")")) %>%
+  select(5)
+
+res3_tab <- 
+  res3$coeftable %>% data.frame() %>% 
+  janitor::clean_names() %>% select(1,2,3)  %>% 
+  mutate(estimate = exp_est %>% round(digits = 2) %>% format(nsmall = 2)) %>%
+  mutate(CI = paste0(estimate," (",gsub(" ", "", x2_5 %>% round(digits = 2) %>% format(nsmall = 2)),", ",x97_5 %>% round(digits = 2) %>% format(nsmall = 2),")")) %>%
+  select(5)
+
+res4_tab <- 
+  res4_df %>%
+  mutate(estimate = boxOdds %>% round(digits = 2) %>% format(nsmall = 2)) %>%
+  mutate(CI = paste0(estimate," (",gsub(" ", "", boxCILow %>% round(digits = 2) %>% format(nsmall = 2)),", ",boxCIHigh %>% round(digits = 2) %>% format(nsmall = 2),")")) %>%
+  select(5)
+```
+
+
+```{r}
+## Table 3
+names <-
+  c("","35-49","16-20","21-34","50-64", "$\\geq65$", "Female" ,"Male", "White",
+    "Black","Hispanic","Others", "High school graduate",
+    "Less than high school","Some college","College graduate/Some graduate",
+    "Alcohol (positive vs. negative)", "Cannabis (positive vs. negative)")
+final_res <- rbind(c("OR (95$\\%$)","OR (95$\\%$)","OR (95$\\%$)","OR (95$\\%$)","OR (95$\\%$)"),
+                   bind_cols(res1_tab, res2_tab, res3_tab, res4_tab))
+
+final_res <- 
+  final_res %>% 
+  add_row(CI...1 = "Ref",CI...2 = "Ref",
+          CI...3 = "Ref",CI...4 = "Ref",
+          .before = 3) %>%
+  add_row(CI...1 = "Ref",CI...2 = "Ref",
+          CI...3 = "Ref",CI...4 = "Ref",
+          .before = 8) %>%
+  add_row(CI...1 = "Ref",CI...2 = "Ref",
+          CI...3 = "Ref",CI...4 = "Ref",
+          .before = 12) %>%
+  add_row(CI...1 = "Ref",CI...2 = "Ref",
+          CI...3 = "Ref",CI...4 = "Ref",
+          .before = 16) 
+  
+final_res <- final_res[-2,]
+
+final_res <- final_res[c(1:6,15,16,7:14,17:18),] 
+
+row.names(final_res) <- names
+final_res %>% 
+  kbl(align="c", linesep="", booktabs = T, escape = FALSE,
+      caption = "Table 4. Odds Ratio of Homicide Victimization in the NVDRS Case Group, as Compared with the NRS Control Group or the NSDUH Control Group Using Four Weighted Logistic Multivariable Models: M1 Shows the Estimate of Regression Coefficients Using the Complete Cases of the NVDRS and NRS Data; M2 Pools the 20 Estimates of Regression Coefficients Using 20 Multiply-Imputed NVDRS and NRS Data; M3 Pools the 20 Estimates of Regression Coefficients Using 20 Multiply-Imputed NVDRS and NSDUH Data after Data Fusion; M4 Pools the 400 Estimates of Regression Coefficients Using 200 Bootstrapped and 2 Multiply-Imputed NVDRS and NSDUH Data after Data Fusion",
+      col.names = linebreak(c("M1: DFBMI\n n = 47,582","M2: DFMI\n n = 47,582",
+                              "M3: CC \\ \\ $\\hspace{1em}$ \n n = 5,205 $\\hspace{1em}$",
+                              "M4: MI\n n = 15,431"
+                              )))  %>%
+  add_header_above(c("","NVDRS+NSDUH" = 2,"NVDRS+NRS" = 2), bold = T) %>%
+  group_rows("Age (years)",2,6) %>%
+  group_rows("Sex",7,8) %>%
+  group_rows("Race",9,12) %>%
+  group_rows("Education",13,16) %>%
+  group_rows("Drug",17,18) %>%
+  kable_styling(full_width = F , html_font = "Cambria", 
+                latex_options = c("HOLD_position", "scale_down"), position = "center")
+```
+
+
+
+```{r}
+## Machine Learning prep for blood cannabis test variable prediction
+NRS_no_na <- clean_NRS  %>%  
+  mutate(marijuana_blood = ifelse(marijuana_blood == "1", "Yes", "No") %>% 
+           fct_relevel("No", "Yes")) %>% select(-weight, -source, -strata, -psu) %>% na.omit()
+NRS_no_na$marijuana_blood <- relevel(NRS_no_na$marijuana_blood, ref = "Yes")
+
+set.seed(79)
+# Training/testing partition
+index_train = createDataPartition(NRS_no_na$marijuana_blood, 
+                                  p = 0.8,
+                                  list = FALSE)
+
+training_df = NRS_no_na[index_train, ]
+testing_df = NRS_no_na[-index_train, ]
+
+# Model matrices
+x_train = model.matrix(marijuana_blood ~ ., training_df)[, -1] # Note that if a row has NAs, it is by default removed using model.matrix!
+x_test = model.matrix(marijuana_blood ~ ., testing_df)[, -1]
+y_train = training_df$marijuana_blood
+y_test = testing_df$marijuana_blood
+
+# Train control with 10-fold cross-validation repeated 5 times
+ctrl = trainControl(method = "cv",
+                    number = 10,
+                    summaryFunction = twoClassSummary,
+                    classProbs = TRUE,
+                    savePredictions = T)
+```
+
+
+```{r}
+#logistic modeling
+set.seed(79)
+logistic.fit <- train(x_train, y_train,
+                      preProcess = c("center", "scale"),
+                      method = "glm",
+                      metric = "ROC",
+                      trControl = ctrl)
+```
+
+
+```{r}
+#lasso modeling
+set.seed(79)
+lasso.fit <- 
+  train(x_train, y_train, method = "glmnet", 
+        tuneGrid = expand.grid(alpha = 1, lambda = exp(seq(10, -10, length = 300))), 
+        preProcess = c("center", "scale"),
+        metric = "ROC",
+        trControl = ctrl)
+```
+
+
+```{r}
+#random forest modeling
+set.seed(79)
+rf_grid_one = expand.grid(mtry = 1:8,
+                          splitrule = "gini",
+                          min.node.size = seq(from = 6, to = 14, by = 2))
+rf.fit = train(x_train, y_train,
+               method = "ranger",
+               tuneGrid = rf_grid_one,
+               metric = "ROC",
+               trControl = ctrl,
+               preProcess = c("center", "scale"))
+```
+
+
+```{r, warning = FALSE, fig.height=10, fig.width=10}
+#gathering results and saving them as plots
+resamp <- resamples(list(Logistic = logistic.fit, 
+                         Lasso = lasso.fit,
+                         Random_Forest = rf.fit), metric = "ROC")
+result <- summary(resamp)
+
+ROC_df <-  
+  tibble(Logistic = result$values$`Logistic~ROC`,
+         Lasso = result$values$`Lasso~ROC`,
+         Random_Forest = result$values$`Random_Forest~ROC`) %>% 
+  pivot_longer(Logistic:Random_Forest, names_to = "method", values_to = "values")
+ROC_df$method <- factor(ROC_df$method, levels = c("Random_Forest","Logistic","Lasso"),ordered = TRUE)
+
+Sens_df <-  
+  tibble(Logistic = result$values$`Logistic~Sens`,
+         Lasso = result$values$`Lasso~Sens`,
+         Random_Forest = result$values$`Random_Forest~Sens`) %>% 
+  pivot_longer(Logistic:Random_Forest, names_to = "method", values_to = "values")
+Sens_df$method <- factor(Sens_df$method, levels = c("Random_Forest","Logistic","Lasso"),ordered = TRUE)
+
+Spec_df <- 
+  tibble(Logistic = result$values$`Logistic~Spec`,
+         Lasso = result$values$`Lasso~Spec`,
+         Random_Forest = result$values$`Random_Forest~Spec`) %>% 
+  pivot_longer(Logistic:Random_Forest, names_to = "method", values_to = "values")
+Spec_df$method <- factor(Spec_df$method, levels = c("Random_Forest","Logistic","Lasso"),ordered = TRUE)
+
+#result$statistics$ROC[,-7] %>% round(digits = 3) %>% 
+#  kbl(caption = "AUC Summary from 10-fold CV Estimate") %>%
+#  kable_styling("striped", full_width = F , html_font = "Cambria",
+#                latex_options = "HOLD_position")
+result1 <-
+  ROC_df %>% 
+  ggplot(aes(x = method, values %>% round(digits = 3), color = method)) + 
+  geom_boxplot(fatten = NULL, alpha = 0.3) +
+  stat_summary(fun = mean, geom = "errorbar", aes(ymax = ..y.., ymin = ..y..),
+               width = 0.75, size = 1, linetype = "solid") + 
+  scale_y_continuous(limits = c(0.7,1)) +
+  coord_flip() +
+  labs(title = "Distribution of the 10-fold CV Estimated AUC (Cannabis)", 
+       subtitle = "Middle box line represents the mean of AUC",
+       x = "Model", y = "Area under the ROC curve",
+       caption = "") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(size = 7, hjust = 0.5),
+        plot.caption = element_text(hjust = 0.5),
+        legend.position = "none")
+
+result2 <-
+  Sens_df %>% 
+  ggplot(aes(x = method, values %>% round(digits = 3), color = method)) + 
+  geom_boxplot(fatten = NULL, alpha = 0.3) +
+  stat_summary(fun = mean, geom = "errorbar", aes(ymax = ..y.., ymin = ..y..),
+               width = 0.75, size = 1, linetype = "solid") + 
+  scale_y_continuous(limits = c(0,1)) +
+  coord_flip() +
+  labs(title = "Distribution of the CV Estimated Sensitivity (Cannabis)", 
+       subtitle = "Middle box line represents the mean of sensitivity",
+       x = "Model", y = "Sensitivity",
+       caption = "") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(size = 7, hjust = 0.5),
+        plot.caption = element_text(hjust = 0.5),
+        legend.position = "none")
+
+result3 <-
+  Spec_df %>% 
+  ggplot(aes(x = method, values, color = method)) + 
+  geom_boxplot(fatten = NULL, alpha = 0.3) +
+  stat_summary(fun = mean, geom = "errorbar", aes(ymax = ..y.., ymin = ..y..),
+               width = 0.75, size = 1, linetype = "solid") + 
+  scale_y_continuous(limits = c(0.95,1)) +
+  coord_flip() +
+  labs(title = "Distribution of the CV Estimated Specificity (Cannabis)", 
+       subtitle = "Middle box line represents the mean of specificity",
+       x = "Model", y = "Specificity",
+       caption = "") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(size = 7, hjust = 0.5),
+        plot.caption = element_text(hjust = 0.5),
+        legend.position = "none")
+```
+
+
+```{r}
+## Machine Learning prep for blood alcohol test variable prediction
+NRS_no_na <- clean_NRS  %>%  
+  mutate(alcohol_blood = ifelse(alcohol_blood == "1", "Yes", "No") %>% 
+           fct_relevel("No", "Yes")) %>% select(-weight, -source, -strata, -psu) %>% na.omit()
+NRS_no_na$alcohol_blood <- relevel(NRS_no_na$alcohol_blood, ref = "Yes")
+
+set.seed(79)
+# Training/testing partition
+index_train = createDataPartition(NRS_no_na$alcohol_blood, 
+                                  p = 0.8,
+                                  list = FALSE)
+
+training_df = NRS_no_na[index_train, ]
+testing_df = NRS_no_na[-index_train, ]
+
+# Model matrices
+x_train = model.matrix(alcohol_blood ~ ., training_df)[, -1] # Note that if a row has NAs, it is by default removed using model.matrix!
+x_test = model.matrix(alcohol_blood ~ ., testing_df)[, -1]
+y_train = training_df$alcohol_blood
+y_test = testing_df$alcohol_blood
+
+# Train control with 10-fold cross-validation repeated 5 times
+ctrl = trainControl(method = "cv",
+                    number = 10,
+                    summaryFunction = twoClassSummary,
+                    classProbs = TRUE,
+                    savePredictions = T)
+```
+
+
+```{r}
+#logistic modeling
+set.seed(79)
+logistic.fit <- train(x_train, y_train,
+                      preProcess = c("center", "scale"),
+                      method = "glm",
+                      metric = "ROC",
+                      trControl = ctrl)
+```
+
+
+```{r}
+#lasso modeling
+set.seed(79)
+lasso.fit <- 
+  train(x_train, y_train, method = "glmnet", 
+        tuneGrid = expand.grid(alpha = 1, lambda = exp(seq(10, -10, length = 300))), 
+        preProcess = c("center", "scale"),
+        metric = "ROC",
+        trControl = ctrl)
+```
+
+
+```{r}
+#random forest modeling
+set.seed(79)
+rf_grid_one = expand.grid(mtry = 1:8,
+                          splitrule = "gini",
+                          min.node.size = seq(from = 6, to = 14, by = 2))
+rf.fit = train(x_train, y_train,
+               method = "ranger",
+               tuneGrid = rf_grid_one,
+               metric = "ROC",
+               trControl = ctrl,
+               preProcess = c("center", "scale"))
+```
+
+
+
+```{r, warning = FALSE, fig.height=10, fig.width=10}
+#gathering results and saving them as plots
+resamp <- resamples(list(Logistic = logistic.fit, 
+                         Lasso = lasso.fit,
+                         Random_Forest = rf.fit), metric = "ROC")
+result <- summary(resamp)
+
+ROC_df <-  
+  tibble(Logistic = result$values$`Logistic~ROC`,
+         Lasso = result$values$`Lasso~ROC`,
+         Random_Forest = result$values$`Random_Forest~ROC`) %>% 
+  pivot_longer(Logistic:Random_Forest, names_to = "method", values_to = "values")
+ROC_df$method <- factor(ROC_df$method, levels = c("Random_Forest","Logistic","Lasso"),ordered = TRUE)
+
+Sens_df <-  
+  tibble(Logistic = result$values$`Logistic~Sens`,
+         Lasso = result$values$`Lasso~Sens`,
+         Random_Forest = result$values$`Random_Forest~Sens`) %>% 
+  pivot_longer(Logistic:Random_Forest, names_to = "method", values_to = "values")
+Sens_df$method <- factor(Sens_df$method, levels = c("Random_Forest","Logistic","Lasso"),ordered = TRUE)
+
+Spec_df <- 
+  tibble(Logistic = result$values$`Logistic~Spec`,
+         Lasso = result$values$`Lasso~Spec`,
+         Random_Forest = result$values$`Random_Forest~Spec`) %>% 
+  pivot_longer(Logistic:Random_Forest, names_to = "method", values_to = "values")
+Spec_df$method <- factor(Spec_df$method, levels = c("Random_Forest","Logistic","Lasso"),ordered = TRUE)
+
+#result$statistics$ROC[,-7] %>% round(digits = 3) %>% 
+#  kbl(caption = "AUC Summary from 10-fold CV Estimate") %>%
+#  kable_styling("striped", full_width = F , html_font = "Cambria",
+#                latex_options = "HOLD_position")
+result4 <-
+  ROC_df %>% 
+  ggplot(aes(x = method, values %>% round(digits = 3), color = method)) + 
+  geom_boxplot(fatten = NULL, alpha = 0.3) +
+  stat_summary(fun = mean, geom = "errorbar", aes(ymax = ..y.., ymin = ..y..),
+               width = 0.75, size = 1, linetype = "solid") + 
+  scale_y_continuous(limits = c(0.7,1)) +
+  coord_flip() +
+  labs(title = "Distribution of the 10-fold CV Estimated AUC (Alcohol)", 
+       subtitle = "Middle box line represents the mean of AUC",
+       x = "Model", y = "Area under the ROC curve",
+       caption = "") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(size = 7, hjust = 0.5),
+        plot.caption = element_text(hjust = 0.5),
+        legend.position = "none")
+
+result5 <-
+  Sens_df %>% 
+  ggplot(aes(x = method, values %>% round(digits = 3), color = method)) + 
+  geom_boxplot(fatten = NULL, alpha = 0.3) +
+  stat_summary(fun = mean, geom = "errorbar", aes(ymax = ..y.., ymin = ..y..),
+               width = 0.75, size = 1, linetype = "solid") + 
+  scale_y_continuous(limits = c(0,1)) +
+  coord_flip() +
+  labs(title = "Distribution of the CV Estimated Sensitivity (Alcohol)", 
+       subtitle = "Middle box line represents the mean of sensitivity",
+       x = "Model", y = "Sensitivity",
+       caption = "") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(size = 7, hjust = 0.5),
+        plot.caption = element_text(hjust = 0.5),
+        legend.position = "none")
+
+result6 <-
+  Spec_df %>% 
+  ggplot(aes(x = method, values, color = method)) + 
+  geom_boxplot(fatten = NULL, alpha = 0.3) +
+  stat_summary(fun = mean, geom = "errorbar", aes(ymax = ..y.., ymin = ..y..),
+               width = 0.75, size = 1, linetype = "solid") + 
+  scale_y_continuous(limits = c(0.95,1)) +
+  coord_flip() +
+  labs(title = "Distribution of the CV Estimated Specificity (Alcohol)", 
+       subtitle = "Middle box line represents the mean of specificity",
+       x = "Model", y = "Specificity",
+       caption = "") +
+  theme(plot.title = element_text(size = 10, hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(size = 7, hjust = 0.5),
+        plot.caption = element_text(hjust = 0.5),
+        legend.position = "none")
+```
+
+
+```{r, warning = FALSE, fig.height=10, fig.width=10}
+#eFigure 2
+(result1+result4)/(result2 +result5 + result3 + result6) + 
+  plot_annotation(title = "Figure 2. Cross-Validated Blood Test Variables Prediction Results",
+                  theme = theme(plot.title = element_text(hjust = 0.5)))
+```
+
