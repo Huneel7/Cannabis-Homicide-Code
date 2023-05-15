@@ -1,0 +1,231 @@
+
+```{r}
+# Create an empty list for NVDRS bootstrap samples
+list_clean_NVDRS <- list()
+
+# setting seed for reproducibility 
+set.seed(7)
+
+# resampling NVDRS for 200 bootstrap samples 
+for (i in 1:200) {
+  list_clean_NVDRS[[i]] <- sample_n(clean_NVDRS, size = nrow(clean_NVDRS),replace = T) %>% 
+  relocate(source, strata,  psu, weight, sex, race, education, 
+           age, alcohol_blood, marijuana_blood)
+}
+
+# creating predictor matrix for multiple imputation
+dry_run <- mice(list_clean_NVDRS[[1]], maxit = 0)
+pred1 <- dry_run$predictorMatrix 
+# we don't use source, strata, and psu as predictors when running mice
+pred1[,c("source","strata", "psu")] <- 0
+```
+
+
+
+```{r, include=FALSE}
+# creating empty list to save imputed samples
+imputed_res <- list()
+imputed_NVDRS_res <- list()
+
+# Multiple Imputation for NVDRS bootstrap samples using parallel computing
+boot_imputed_NVDRS <- function(B){
+  registerDoParallel(2)
+  system.time({
+    imputed_NVDRS_res <- foreach(i = 1:B) %dopar% {
+    
+    df <- list_clean_NVDRS[[i]]
+    NVDRS_df <- mice(data = df, m = 2, predictorMatrix = pred1,
+                     method = c("logreg","norm","norm", "norm", "logreg","polyreg","polr", "polr", 
+                                "lasso.logreg", "lasso.logreg"), 
+                     maxit = 5, seed = 79)
+    for (j in 1:2) {
+      imputed_res[[j]] <- complete(NVDRS_df, j)
+    }
+      
+    imputed_NVDRS_res[[i]] <- imputed_res
+  }
+  })
+  return(imputed_NVDRS_res)
+}
+
+# saving the results of 2 imputation of 200 NVDRS bootstrap samples
+res1_boot <- boot_imputed_NVDRS(200)
+```
+
+
+
+```{r}
+# Create an empty list for NRS+NSDUH bootstrap samples
+list_clean_NRS <- list()
+list_clean_NSDUH <- list()
+
+# setting seed for reproducibility
+set.seed(7)
+
+# resampling NRS and NSDUH for 200 stratified bootstrap samples
+for (i in 1:200) {
+  list_clean_NRS[[i]] <- clean_NRS %>% group_by(strata) %>% sample_n(size = 2830, replace = T) %>% ungroup()
+  list_clean_NSDUH[[i]] <- clean_NSDUH %>% group_by(strata) %>% sample_n(size = 724, replace = T) %>% ungroup()
+}
+
+# aggregating NRS and NSDUH for data fusion and multiple imputation
+list_NRS_NSDUH <- list()
+for (i in 1:length(list_clean_NRS)) {
+  list_NRS_NSDUH[[i]] <- full_join(list_clean_NRS[[i]], list_clean_NSDUH[[i]]) %>%
+  relocate(source, strata, psu, weight, sex, race, education, age, alcohol_self_report, alcohol_oral,
+           alcohol_blood, marijuana_self_report, marijuana_oral, marijuana_blood)
+}
+
+# creating predictor matrix for multiple imputation
+dry_run <- mice(list_NRS_NSDUH[[1]], maxit = 0)
+pred1 <- dry_run$predictorMatrix 
+# we don't use source, strata, and psu as predictors when running mice
+pred1[,c("source","strata", "psu")] <- 0
+```
+
+
+```{r, include=FALSE}
+# creating empty list to save imputed samples
+imputed_res <- list()
+imputed_NRS_NSDUH_res <- list()
+
+# Multiple Imputation for NRS+NSDUH bootstrap samples using parallel computing
+boot_imputed_NRS_NSDUH <- function(B){
+  registerDoParallel(2)
+  system.time({
+    imputed_NRS_NSDUH_res <- foreach(i = 1:B) %dopar% {
+    
+    df <- list_NRS_NSDUH[[i]]
+    NRS_NSDUH_df <- mice(data = df, m = 2, predictorMatrix = pred1, 
+                         method = c("logreg", "norm", "norm", "norm", "logreg","polyreg","polr", "polr", 
+                                    "lasso.logreg", "lasso.logreg","lasso.logreg",
+                                    "lasso.logreg", "lasso.logreg", "lasso.logreg"), 
+                         maxit = 5, seed = 7)
+      
+    for (j in 1:2) {
+      imputed_res[[j]] <- complete(NRS_NSDUH_df, j)
+    }
+      
+    imputed_NRS_NSDUH_res[[i]] <- imputed_res
+  }
+  })
+  return(imputed_NRS_NSDUH_res)
+}
+
+# saving the results of 2 imputation of 200 NRS+NSDUH bootstrap samples
+res2_boot <- boot_imputed_NRS_NSDUH(200)
+```
+
+
+
+```{r}
+#assemble lists into simpler structures (vectors)
+res1_boot <- do.call(c, res1_boot)
+res2_boot <- do.call(c, res2_boot)
+```
+
+
+```{r}
+# Creating empty lists to aggregated the multiply imputed bootstrap samples
+imputed_NVDRS <- list()
+imputed_NRS_NSDUH <- list()
+full_imps <- list()
+
+# Assigning the outcome variable to imputed NVDRS bootstrap samples
+for (i in 1:length(res1_boot)) {
+  imputed_NVDRS[[i]] <- res1_boot[[i]] %>% mutate(homicide = 1)
+}
+
+# Assigning the outcome variable to imputed NRS+NSDUH bootstrap samples
+for (i in 1:length(res2_boot)) {
+  imputed_NRS_NSDUH[[i]] <- res2_boot[[i]] %>% 
+  select(-marijuana_self_report, -marijuana_oral, -alcohol_self_report, -alcohol_oral)  %>%
+  mutate(homicide = 0)
+}
+
+# combinging the imputed NSDUH and NVDRS by rows and relevel the categorical variables while discarding the imputed NRS
+full_imps <- list()
+for (i in 1:length(res2_boot)) {
+  full_imps[[i]] <- rbind(imputed_NRS_NSDUH[[i]], imputed_NVDRS[[i]]) %>% filter(!(source == "NRS")) %>% 
+  mutate(age = fct_relevel(age, c("3","0","1","2","4")))  %>% 
+  mutate(education = fct_relevel(education, c("2","1","3","4")))
+}
+```
+
+
+```{r}
+# Function for survey regression modeling for each imputed bootstrap sample
+analyseImp <- function(inputData) {
+      svy_mod <- svydesign(strata=~strata, id=~psu, weights=~weight, data=inputData, nest=T) 
+      mod<- svyglm(homicide ~ age + race + education + sex + alcohol_blood + marijuana_blood,
+                   family=quasibinomial, design=svy_mod)
+      res <- summ(mod, exp = TRUE, confint = TRUE)
+      res$coeftable[,1]
+    }
+
+# saving the regression results of 400 bootstrap samples in list
+boot_res <- list()
+for (i in 1:length(full_imps)) {
+  boot_res[[i]] <- analyseImp(full_imps[[i]]) %>% t() %>% data.frame() %>% janitor::clean_names()
+}
+
+#assemble list into simpler structure (vectors)
+boot1_res <- do.call(rbind, boot_res)
+```
+
+
+```{r}
+## saving the regression result twice for group means and total mean
+boot_comb_coef1 <- boot1_res
+boot_comb_coef2 <- boot1_res
+
+# computing the group means of 2 imputed bootstrap samples
+for (i in 1:ncol(boot_comb_coef1)) {
+  coef_res <- colMeans(matrix(boot_comb_coef1[,i],2))
+  boot_comb_coef1[,i] <- coef_res
+}
+
+# saving the group means and pooling the point estimates for the total mean of each variable
+boot_comb_coef_group_mean <- boot_comb_coef1[1:(nrow(boot_comb_coef1)/2),]
+boot_comb_coef_total_mean <- colMeans(boot_comb_coef2)
+```
+
+
+
+```{r}
+# Creating vectors to save Model 1 result using BMI inference
+nBoot <- 200
+nImp <- 2
+est <- vector()
+var <- vector()
+df <- vector()
+CI <- vector()
+
+# Looping to get the result of each variable in the regression model
+for (i in 1:ncol(boot_comb_coef2)) {
+  SSW <- sum((boot_comb_coef2[,i] - rep(boot_comb_coef_group_mean[,i], each = 2))^2)
+  SSB <- nImp*sum((boot_comb_coef_group_mean[,i] - boot_comb_coef_total_mean[i])^2)
+  # mean square within the bootstrapped data sets and between the imputed data sets
+  MSW <- SSW/(nBoot*(nImp-1))
+  # mean square between the bootstrapped datasets
+  MSB <- SSB/(nBoot-1) 
+  # variance component 1
+  resVar <- MSW
+  # variance component 2
+  randIntVar <- (MSB-MSW)/nImp
+  # saving the pooled point estimates
+  est[i] <- boot_comb_coef_total_mean[i]
+  # computing BMI variance
+  var[i] <- (1+1/nBoot)*randIntVar + resVar/(nBoot*nImp)
+  # computing degrees of freedom for 95% confidence interval
+  df[i] <- (var[i]^2)/((((nBoot+1)/(nBoot*nImp))^2*MSB^2 / (nBoot-1)) + MSW^2/(nBoot*nImp^2*(nImp-1)))
+  # computing confidence interval and saving the results in a neat form
+  CI[i] = paste0(est[i] %>% round(digits = 2)," ","(",
+                 (est[i]-stats::qt(0.975,df[i])*var[i]^0.5) %>% round(digits = 2),
+                 ", ",(est[i]+stats::qt(0.975,df[i])*var[i]^0.5) %>% round(digits = 2),")")
+}
+
+# saving the final Model 1 result
+res1_tab <- data.frame(CI = CI)
+```
+
