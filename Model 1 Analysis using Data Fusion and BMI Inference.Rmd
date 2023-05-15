@@ -131,12 +131,12 @@ imputed_NVDRS <- list()
 imputed_NRS_NSDUH <- list()
 full_imps <- list()
 
-# Assigning the outcome variable to imputed NVDRS bootstrap samples
+# Assigning the outcome variable (case) to imputed NVDRS bootstrap samples for case-control analysis
 for (i in 1:length(res1_boot)) {
   imputed_NVDRS[[i]] <- res1_boot[[i]] %>% mutate(homicide = 1)
 }
 
-# Assigning the outcome variable to imputed NRS+NSDUH bootstrap samples
+# Assigning the outcome variable (control) to imputed NRS+NSDUH bootstrap samples for case-control analysis
 for (i in 1:length(res2_boot)) {
   imputed_NRS_NSDUH[[i]] <- res2_boot[[i]] %>% 
   select(-marijuana_self_report, -marijuana_oral, -alcohol_self_report, -alcohol_oral)  %>%
