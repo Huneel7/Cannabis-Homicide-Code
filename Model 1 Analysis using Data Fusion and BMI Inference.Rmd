@@ -159,7 +159,7 @@ analyseImp <- function(inputData) {
       svy_mod <- svydesign(strata=~strata, id=~psu, weights=~weight, data=inputData, nest=T) 
       mod<- svyglm(homicide ~ age + race + education + sex + alcohol_blood + marijuana_blood,
                    family=quasibinomial, design=svy_mod)
-      res <- summ(mod, exp = TRUE, confint = TRUE)
+      res <- summ(mod, exp = FALSE, confint = TRUE)
       res$coeftable[,1]
     }
 
@@ -220,9 +220,9 @@ for (i in 1:ncol(boot_comb_coef2)) {
   # computing degrees of freedom for 95% confidence interval
   df[i] <- (var[i]^2)/((((nBoot+1)/(nBoot*nImp))^2*MSB^2 / (nBoot-1)) + MSW^2/(nBoot*nImp^2*(nImp-1)))
   # computing confidence interval and saving the results in a neat form
-  CI[i] = paste0(est[i] %>% round(digits = 2)," ","(",
-                 (est[i]-stats::qt(0.975,df[i])*var[i]^0.5) %>% round(digits = 2),
-                 ", ",(est[i]+stats::qt(0.975,df[i])*var[i]^0.5) %>% round(digits = 2),")")
+  CI[i] = paste0(exp(est[i]) %>% round(digits = 2)," ","(",
+                 exp(est[i]-stats::qt(0.975,df[i])*var[i]^0.5) %>% round(digits = 2),
+                 ", ",exp(est[i]+stats::qt(0.975,df[i])*var[i]^0.5) %>% round(digits = 2),")")
 }
 
 # saving the final Model 1 result
